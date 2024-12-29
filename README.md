@@ -8,7 +8,8 @@ This whitepaper presents a comprehensive protocol for a privacy-preserving digit
 
 ## 1. Introduction
 This implementation can become gold for freedom commerce and privacy, a nightmare for oppressive government
-my personal cent to motivate users to get this direction 
+my personal cent to motivate users to get this direction
+
 ### 1.1 Motivation
 Current digital identity systems face fundamental challenges in balancing security with privacy.
 Traditional approaches require users to share personal information with service providers, creating vulnerabilities through centralized data storage and enabling unwanted tracking of individual activities. Additionally, the advent of quantum computing threatens many cryptographic primitives underlying existing identity systems.
@@ -22,6 +23,18 @@ The Secure Identity Protocol addresses these challenges through the following pr
 - User sovereignty over personal data
 - Decentralized verification without trusted authorities
 read the papers
+
+Note: Solana was filtered by me as the best chain with less fees for transactions and necessary scalability, more a protocol to enhance privacy. Secure Unique Authentications will cost about nothing to sites.
+
+As You can see all this is clearly wrote by an LLM
+
+All  Code come from Claude, main concept is mine and i corrected many fatal mistakes along the way.
+In the concepts, not in the code. Be care with any code you'll find in this repository.
+As this is the state of art  of the No Code Systems
+
+This project is just for fun and for you.
+If you want , be inspired , or contribute. 
+But read the license, and choose if your project is  good or evil.
 The Nizix  dec 2024
 
 
