@@ -1,5 +1,8 @@
-#!/bin/bash
 
+
+OBSOLETE-delete
+
+#!/bin/bash
 # Create project structure
 cargo new secure-identity-node
 cd secure-identity-node

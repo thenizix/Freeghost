@@ -1,56 +1,84 @@
 // src/network/protocols/p2p.rs
-use libp2p::{
-    identity,
-    Swarm,
-    NetworkBehaviour,
-    gossipsub::{Gossipsub, GossipsubConfig},
-};
-
-#[derive(NetworkBehaviour)]
-pub struct P2PBehavior {
-    gossipsub: Gossipsub,
-}
-
 pub struct P2PProtocol {
-    swarm: Swarm<P2PBehavior>,
-    topics: HashMap<MessageType, TopicHash>,
+    network: Arc<P2PNetwork>,
+    discovery_service: Arc<DiscoveryService>,
+    message_handler: Arc<MessageHandler>,
 }
 
-#[async_trait]
-impl NetworkProtocol for P2PProtocol {
-    async fn broadcast(&self, message: NetworkMessage) -> Result<()> {
-        let topic = self.topics.get(&message.message_type)
-            .ok_or_else(|| NodeError::Network("Unknown message type".into()))?;
-            
-        self.swarm.behaviour_mut().gossipsub.publish(
-            topic.clone(),
-            serde_json::to_vec(&message)?
-        )?;
+impl P2PProtocol {
+    pub async fn new(config: P2PConfig) -> Result<Self> {
+        let network = Arc::new(P2PNetwork::new(config).await?);
+        let discovery_service = Arc::new(DiscoveryService::new(network.clone()));
+        let message_handler = Arc::new(MessageHandler::new(network.clone()));
+        
+        Ok(Self {
+            network,
+            discovery_service,
+            message_handler,
+        })
+    }
+
+    pub async fn start(&self) -> Result<()> {
+        // Start network maintenance
+        self.network.start_network_maintenance().await;
+        
+        // Start peer discovery
+        self.discovery_service.start().await?;
+        
+        // Start message handling
+        self.message_handler.start().await?;
         
         Ok(())
     }
 
-    async fn verify_template(&self, template: &Template) -> Result<bool> {
-        let message = NetworkMessage {
-            id: Uuid::new_v4().to_string(),
-            message_type: MessageType::TemplateVerification,
-            payload: serde_json::to_vec(template)?,
-            timestamp: chrono::Utc::now().timestamp(),
-        };
+    pub async fn stop(&self) -> Result<()> {
+        self.discovery_service.stop().await?;
+        self.message_handler.stop().await?;
+        Ok(())
+    }
+}
 
-        self.broadcast(message).await?;
-        
-        // Wait for consensus
-        let mut verification_responses = 0;
-        let timeout = tokio::time::sleep(Duration::from_secs(30));
-        
-        tokio::select! {
-            _ = timeout => {
-                Ok(false)
-            }
-            result = self.wait_for_consensus() => {
-                Ok(result?)
-            }
+// Add discovery service implementation
+struct DiscoveryService {
+    network: Arc<P2PNetwork>,
+    bootstrap_peers: Vec<String>,
+}
+
+impl DiscoveryService {
+    pub fn new(network: Arc<P2PNetwork>) -> Self {
+        Self {
+            network,
+            bootstrap_peers: Vec::new(),
         }
+    }
+
+    pub async fn start(&self) -> Result<()> {
+        // Implementation for peer discovery
+        // This would include DHT, bootstrap nodes, etc.
+        todo!("Implement peer discovery")
+    }
+
+    pub async fn stop(&self) -> Result<()> {
+        todo!("Implement discovery shutdown")
+    }
+}
+
+// Add message handler implementation
+struct MessageHandler {
+    network: Arc<P2PNetwork>,
+}
+
+impl MessageHandler {
+    pub fn new(network: Arc<P2PNetwork>) -> Self {
+        Self { network }
+    }
+
+    pub async fn start(&self) -> Result<()> {
+        // Implementation for message handling
+        todo!("Implement message handling")
+    }
+
+    pub async fn stop(&self) -> Result<()> {
+        todo!("Implement handler shutdown")
     }
 }
