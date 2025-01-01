@@ -1,258 +1,191 @@
-// src/core/crypto/quantum.rs
+use std::sync::RwLock;
+use ring::rand::SystemRandom;
+use sha3::{Sha3_256, Digest};
 
-use super::secure_memory::SecureMemory;
-use super::types::{KeyPair, Signature, VerificationResult};
-use sha3::{Sha3_512, Digest};
-use std::sync::Arc;
-use thiserror::Error;
-use uuid::Uuid;
-
-#[derive(Debug, Error)]
-pub enum QuantumError {
-    #[error("Key generation failed")]
-    KeyGenerationFailed,
-    #[error("Signing operation failed")]
-    SigningFailed,
-    #[error("Verification failed")]
-    VerificationFailed,
-    #[error("Invalid key format")]
-    InvalidKeyFormat,
-    #[error("Memory operation failed: {0}")]
-    MemoryError(String),
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum SecurityLevel {
-    Basic,      // NIST Level 1
-    Standard,   // NIST Level 3
-    High,       // NIST Level 5
-}
+use crate::{
+    utils::error::{Result, NodeError},
+    core::crypto::{
+        kyber::{KyberKEM, PublicKey as KyberPublicKey, SecretKey as KyberSecretKey},
+        dilithium::{Dilithium, PublicKey as DilithiumPublicKey, SecretKey as DilithiumSecretKey, Signature},
+        serialization::{
+            serialize_public_key, deserialize_public_key,
+            serialize_secret_key, deserialize_secret_key,
+            serialize_ciphertext, deserialize_ciphertext,
+        },
+    },
+};
 
 pub struct QuantumResistantProcessor {
-    security_level: SecurityLevel,
-    memory_pool: Arc<MemoryPool>,
+    rng: SystemRandom,
+    state: RwLock<ProcessorState>,
+    kyber_cache: RwLock<KyberCache>,
 }
 
-struct MemoryPool {
-    keypair_memory: SecureMemory,
-    signature_memory: SecureMemory,
+#[derive(Default)]
+struct ProcessorState {
+    current_round: u64,
+    entropy_pool: Vec<u8>,
+}
+
+#[derive(Default)]
+struct KyberCache {
+    public_key: Option<KyberPublicKey>,
+    secret_key: Option<KyberSecretKey>,
+}
+
+pub struct ZeroKnowledgeProof {
+    pub commitment: Vec<u8>,
+    pub challenge: Vec<u8>,
+    pub response: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum QuantumAlgorithm {
+    Kyber,
+    Dilithium,
+    // Future: Add SPHINCS+, etc.
 }
 
 impl QuantumResistantProcessor {
-    pub fn new(security_level: SecurityLevel) -> Result<Self, QuantumError> {
-        let memory_pool = Arc::new(MemoryPool {
-            keypair_memory: SecureMemory::new(8192)
-                .map_err(|e| QuantumError::MemoryError(e.to_string()))?,
-            signature_memory: SecureMemory::new(4096)
-                .map_err(|e| QuantumError::MemoryError(e.to_string()))?,
-        });
-
+    pub fn new() -> Result<Self> {
         Ok(Self {
-            security_level,
-            memory_pool,
+            rng: SystemRandom::new(),
+            state: RwLock::new(ProcessorState {
+                current_round: 0,
+                entropy_pool: Vec::with_capacity(1024),
+            }),
+            kyber_cache: RwLock::new(KyberCache::default()),
         })
     }
 
-    pub fn generate_keypair(&self) -> Result<KeyPair, QuantumError> {
-        // Initialize Dilithium parameters based on security level
-        let params = match self.security_level {
-            SecurityLevel::Basic => dilithium::Params::new_weak(),
-            SecurityLevel::Standard => dilithium::Params::new_medium(),
-            SecurityLevel::High => dilithium::Params::new_strong(),
-        };
-
-        // Generate keypair using Dilithium
-        let (public_key, secret_key) = dilithium::keypair(&params)
-            .map_err(|_| QuantumError::KeyGenerationFailed)?;
-
-        // Store secret key in secure memory
-        let mut secret_key_bytes = secret_key.to_bytes();
-        self.memory_pool.keypair_memory.write(&secret_key_bytes)
-            .map_err(|e| QuantumError::MemoryError(e.to_string()))?;
-
-        // Clear sensitive data
-        secret_key_bytes.iter_mut().for_each(|x| *x = 0);
-
-        Ok(KeyPair {
-            id: Uuid::new_v4(),
-            public_key: public_key.to_bytes().to_vec(),
-            created_at: chrono::Utc::now().timestamp(),
-            algorithm: String::from("CRYSTALS-Dilithium"),
-            security_level: self.security_level,
-        })
+    pub fn generate_keypair(&self) -> Result<((Vec<u8>, Vec<u8>), (Vec<u8>, Vec<u8>))> {
+        // Generate Kyber keypair
+        let (pk, sk) = KyberKEM::keygen()?;
+        
+        // Cache the keypair for later use
+        let mut cache = self.kyber_cache.write().unwrap();
+        cache.public_key = Some(pk.clone());
+        cache.secret_key = Some(sk.clone());
+        
+        // Serialize keys
+        let pk_bytes = serialize_public_key(&pk)?;
+        let sk_bytes = serialize_secret_key(&sk)?;
+        
+        Ok((pk_bytes, sk_bytes))
     }
 
-    pub fn sign(&self, message: &[u8], keypair: &KeyPair) -> Result<Signature, QuantumError> {
-        // Hash message using SHA3-512
-        let mut hasher = Sha3_512::new();
-        hasher.update(message);
-        let message_hash = hasher.finalize();
-
-        // Set up Dilithium parameters
-        let params = match keypair.security_level {
-            SecurityLevel::Basic => dilithium::Params::new_weak(),
-            SecurityLevel::Standard => dilithium::Params::new_medium(),
-            SecurityLevel::High => dilithium::Params::new_strong(),
-        };
-
-        // Create signature using Dilithium
-        let mut secret_key_bytes = vec![0u8; params.secret_key_size()];
-        self.memory_pool.keypair_memory.read(&mut secret_key_bytes)
-            .map_err(|e| QuantumError::MemoryError(e.to_string()))?;
-
-        let secret_key = dilithium::SecretKey::from_bytes(&secret_key_bytes, &params)
-            .map_err(|_| QuantumError::InvalidKeyFormat)?;
-
-        let signature = dilithium::sign(&message_hash, &secret_key, &params)
-            .map_err(|_| QuantumError::SigningFailed)?;
-
-        // Store signature in secure memory
-        self.memory_pool.signature_memory.write(&signature.to_bytes())
-            .map_err(|e| QuantumError::MemoryError(e.to_string()))?;
-
-        // Clear sensitive data
-        secret_key_bytes.iter_mut().for_each(|x| *x = 0);
-
-        Ok(Signature {
-            id: Uuid::new_v4(),
-            keypair_id: keypair.id,
-            signature_data: signature.to_bytes().to_vec(),
-            created_at: chrono::Utc::now().timestamp(),
-        })
-    }
-
-    pub fn verify(&self, message: &[u8], signature: &Signature, public_key: &[u8]) -> Result<VerificationResult, QuantumError> {
-        // Hash message using SHA3-512
-        let mut hasher = Sha3_512::new();
-        hasher.update(message);
-        let message_hash = hasher.finalize();
-
-        // Set up Dilithium parameters based on signature size
-        let params = if signature.signature_data.len() <= 2420 {
-            dilithium::Params::new_weak()
-        } else if signature.signature_data.len() <= 3293 {
-            dilithium::Params::new_medium()
+    pub fn create_zkp(
+        &self,
+        features: &[f32],
+        private_key: &[u8],
+    ) -> Result<ZeroKnowledgeProof> {
+        // Deserialize private key if provided, otherwise use cached key
+        let sk = if !private_key.is_empty() {
+            deserialize_secret_key(private_key)?
         } else {
-            dilithium::Params::new_strong()
+            let cache = self.kyber_cache.read().unwrap();
+            cache.secret_key.as_ref()
+                .ok_or_else(|| NodeError::Crypto("No secret key available".into()))?
+                .clone()
         };
-
-        // Parse public key and signature
-        let public_key = dilithium::PublicKey::from_bytes(public_key, &params)
-            .map_err(|_| QuantumError::InvalidKeyFormat)?;
         
-        let dilithium_signature = dilithium::Signature::from_bytes(&signature.signature_data, &params)
-            .map_err(|_| QuantumError::InvalidKeyFormat)?;
-
-        // Verify signature
-        let is_valid = dilithium::verify(&message_hash, &dilithium_signature, &public_key, &params)
-            .map_err(|_| QuantumError::VerificationFailed)?;
-
-        Ok(VerificationResult {
-            is_valid,
-            verified_at: chrono::Utc::now().timestamp(),
-            signature_id: signature.id,
+        // Use features to create a seed for randomness
+        let mut feature_bytes = Vec::with_capacity(features.len() * 4);
+        for &f in features {
+            feature_bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        
+        // Generate commitment using Kyber encapsulation
+        let (pk, _) = KyberKEM::keygen()?; // Temporary key for proof
+        let (shared_secret, ct) = KyberKEM::encapsulate(&pk)?;
+        
+        // Create challenge using features and commitment
+        let mut hasher = Sha3_256::new();
+        hasher.update(&feature_bytes);
+        hasher.update(&shared_secret);
+        let challenge = hasher.finalize().to_vec();
+        
+        // Create response using ciphertext
+        let response = serialize_ciphertext(&ct)?;
+        
+        Ok(ZeroKnowledgeProof {
+            commitment: shared_secret,
+            challenge,
+            response,
         })
     }
 
-    pub fn change_security_level(&mut self, new_level: SecurityLevel) {
-        self.security_level = new_level;
-    }
-}
-
-// Mock Dilithium module for compilation
-mod dilithium {
-    use super::SecurityLevel;
-    
-    pub struct Params {
-        security_level: SecurityLevel,
-    }
-
-    impl Params {
-        pub fn new_weak() -> Self {
-            Self { security_level: SecurityLevel::Basic }
+    pub fn verify_zkp(
+        &self,
+        proof: &ZeroKnowledgeProof,
+        features: &[f32],
+        _public_hash: &str,
+    ) -> Result<bool> {
+        // Verify proof structure
+        if proof.commitment.len() != 32 || proof.challenge.len() != 32 {
+            return Ok(false);
         }
-
-        pub fn new_medium() -> Self {
-            Self { security_level: SecurityLevel::Standard }
+        
+        // Reconstruct feature bytes
+        let mut feature_bytes = Vec::with_capacity(features.len() * 4);
+        for &f in features {
+            feature_bytes.extend_from_slice(&f.to_le_bytes());
         }
-
-        pub fn new_strong() -> Self {
-            Self { security_level: SecurityLevel::High }
+        
+        // Verify challenge
+        let mut hasher = Sha3_256::new();
+        hasher.update(&feature_bytes);
+        hasher.update(&proof.commitment);
+        let expected_challenge = hasher.finalize();
+        
+        if proof.challenge != expected_challenge.as_slice() {
+            return Ok(false);
         }
-
-        pub fn secret_key_size(&self) -> usize {
-            match self.security_level {
-                SecurityLevel::Basic => 2528,
-                SecurityLevel::Standard => 4000,
-                SecurityLevel::High => 4864,
+        
+        // Verify ciphertext
+        let ct = deserialize_ciphertext(&proof.response)?;
+        
+        // Use cached secret key for verification
+        let cache = self.kyber_cache.read().unwrap();
+        if let Some(sk) = &cache.secret_key {
+            let decapsulated = KyberKEM::decapsulate(sk, &ct)?;
+            if decapsulated != proof.commitment {
+                return Ok(false);
             }
+        } else {
+            return Err(NodeError::Crypto("No secret key available".into()));
         }
-    }
-
-    pub struct SecretKey {
-        data: Vec<u8>,
-    }
-
-    pub struct PublicKey {
-        data: Vec<u8>,
-    }
-
-    pub struct Signature {
-        data: Vec<u8>,
-    }
-
-    impl SecretKey {
-        pub fn from_bytes(bytes: &[u8], _params: &Params) -> Result<Self, ()> {
-            Ok(Self { data: bytes.to_vec() })
-        }
-
-        pub fn to_bytes(&self) -> Vec<u8> {
-            self.data.clone()
-        }
-    }
-
-    impl PublicKey {
-        pub fn from_bytes(bytes: &[u8], _params: &Params) -> Result<Self, ()> {
-            Ok(Self { data: bytes.to_vec() })
-        }
-
-        pub fn to_bytes(&self) -> Vec<u8> {
-            self.data.clone()
-        }
-    }
-
-    impl Signature {
-        pub fn from_bytes(bytes: &[u8], _params: &Params) -> Result<Self, ()> {
-            Ok(Self { data: bytes.to_vec() })
-        }
-
-        pub fn to_bytes(&self) -> Vec<u8> {
-            self.data.clone()
-        }
-    }
-
-    pub fn keypair(params: &Params) -> Result<(PublicKey, SecretKey), ()> {
-        let sk_size = params.secret_key_size();
-        let pk_size = sk_size / 2;
         
-        Ok((
-            PublicKey { data: vec![0; pk_size] },
-            SecretKey { data: vec![0; sk_size] }
-        ))
-    }
-
-    pub fn sign(message: &[u8], _secret_key: &SecretKey, params: &Params) -> Result<Signature, ()> {
-        let sig_size = match params.security_level {
-            SecurityLevel::Basic => 2420,
-            SecurityLevel::Standard => 3293,
-            SecurityLevel::High => 4595,
-        };
+        // Update state
+        let mut state = self.state.write().unwrap();
+        state.current_round += 1;
         
-        Ok(Signature { data: vec![0; sig_size] })
+        Ok(true)
     }
 
-    pub fn verify(message: &[u8], _signature: &Signature, _public_key: &PublicKey, _params: &Params) -> Result<bool, ()> {
-        Ok(!message.is_empty())
+    pub fn refresh_entropy(&self) -> Result<()> {
+        let mut state = self.state.write().unwrap();
+        
+        // Generate new entropy
+        let mut new_entropy = vec![0u8; 1024];
+        self.rng
+            .fill(&mut new_entropy)
+            .map_err(|_| NodeError::Crypto("Failed to generate entropy".into()))?;
+
+        // Update entropy pool
+        state.entropy_pool = new_entropy;
+        
+        // Regenerate Kyber keypair
+        let (pk, sk) = KyberKEM::keygen()?;
+        let mut cache = self.kyber_cache.write().unwrap();
+        cache.public_key = Some(pk);
+        cache.secret_key = Some(sk);
+        
+        Ok(())
+    }
+
+    pub fn get_algorithm_details(&self) -> Vec<QuantumAlgorithm> {
+        vec![QuantumAlgorithm::Kyber]
     }
 }
 
@@ -262,31 +195,54 @@ mod tests {
 
     #[test]
     fn test_keypair_generation() {
-        let processor = QuantumResistantProcessor::new(SecurityLevel::Standard).unwrap();
-        let keypair = processor.generate_keypair().unwrap();
-        assert!(!keypair.public_key.is_empty());
+        let processor = QuantumResistantProcessor::new().unwrap();
+        let (public_key, private_key) = processor.generate_keypair().unwrap();
+        
+        // Keys should be properly serialized now
+        assert!(public_key.len() > 32);
+        assert!(private_key.len() > 32);
+        assert_ne!(public_key, private_key);
+        
+        // Verify keys can be deserialized
+        assert!(deserialize_public_key(&public_key).is_ok());
+        assert!(deserialize_secret_key(&private_key).is_ok());
     }
 
     #[test]
-    fn test_sign_and_verify() {
-        let processor = QuantumResistantProcessor::new(SecurityLevel::Standard).unwrap();
-        let keypair = processor.generate_keypair().unwrap();
-        let message = b"test message";
-        
-        let signature = processor.sign(message, &keypair).unwrap();
-        let verification = processor.verify(message, &signature, &keypair.public_key).unwrap();
-        
-        assert!(verification.is_valid);
+    fn test_zkp_creation_and_verification() {
+        let processor = QuantumResistantProcessor::new().unwrap();
+        let features = vec![0.1, 0.2, 0.3];
+        let (_, private_key) = processor.generate_keypair().unwrap();
+
+        let proof = processor.create_zkp(&features, &private_key).unwrap();
+        let valid = processor
+            .verify_zkp(&proof, &features, "test_hash")
+            .unwrap();
+
+        assert!(valid);
     }
 
     #[test]
-    fn test_security_level_change() {
-        let mut processor = QuantumResistantProcessor::new(SecurityLevel::Basic).unwrap();
-        let keypair1 = processor.generate_keypair().unwrap();
+    fn test_entropy_refresh() {
+        let processor = QuantumResistantProcessor::new().unwrap();
+        assert!(processor.refresh_entropy().is_ok());
         
-        processor.change_security_level(SecurityLevel::High);
-        let keypair2 = processor.generate_keypair().unwrap();
+        let state = processor.state.read().unwrap();
+        assert_eq!(state.entropy_pool.len(), 1024);
+    }
+
+    #[test]
+    fn test_invalid_proof() {
+        let processor = QuantumResistantProcessor::new().unwrap();
+        let features = vec![0.1, 0.2, 0.3];
         
-        assert!(keypair2.public_key.len() > keypair1.public_key.len());
+        let invalid_proof = ZeroKnowledgeProof {
+            commitment: vec![0; 32],
+            challenge: vec![0; 32],
+            response: vec![0; 64],
+        };
+        
+        let result = processor.verify_zkp(&invalid_proof, &features, "test_hash").unwrap();
+        assert!(!result);
     }
 }

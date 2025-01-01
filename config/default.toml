@@ -1,0 +1,49 @@
+# Node Configuration
+[node]
+id = "node1"  # Unique identifier for this node
+host = "127.0.0.1"
+port = 8080
+log_level = "info"  # debug, info, warn, error
+data_dir = "./data"
+
+# Network Configuration
+[network]
+use_tor = false
+peers = []  # Will be populated by bootstrap nodes
+max_connections = 50
+connection_timeout = 30  # seconds
+heartbeat_interval = 60  # seconds
+peer_cleanup_interval = 300  # seconds
+bootstrap_nodes = [
+    "node1.freeghost.net:8080",
+    "node2.freeghost.net:8080"
+]
+listen_addresses = [
+    "/ip4/0.0.0.0/tcp/8080",
+    "/ip4/0.0.0.0/tcp/8081"
+]
+
+# Storage Configuration
+[storage]
+path = "./data/storage"
+encryption_key = ""  # Must be set in local.toml or environment
+max_size_gb = 10
+backup_interval = 86400  # 24 hours in seconds
+compression_enabled = true
+
+# Plugin Configuration
+[plugins]
+enabled = true
+directory = "./plugins"
+allowed_origins = ["*"]  # Restrict for production
+auto_update = false
+sandbox_enabled = true
+
+# Security Configuration
+[security]
+tls_enabled = false
+tls_cert_path = ""  # Required if tls_enabled = true
+tls_key_path = ""   # Required if tls_enabled = true
+max_request_size = 10485760  # 10MB in bytes
+rate_limit_requests = 100    # Requests per window
+rate_limit_window = 60       # Window in seconds

@@ -1,379 +1,174 @@
-// src/core/crypto/key_manager.rs
+use std::sync::RwLock;
+use ring::{aead, digest, pbkdf2};
+use sha3::{Sha3_256, Digest};
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 
-use super::secure_memory::SecureMemory;
-use super::quantum::{QuantumResistantProcessor, SecurityLevel};
-use super::types::{KeyPair, CryptoMetadata};
-use super::audit::{AuditSystem, AuditEventType};
-use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
-use thiserror::Error;
-use tokio::sync::RwLock;
-use uuid::Uuid;
+use crate::utils::error::{Result, NodeError};
 
-#[derive(Debug, Error)]
-pub enum KeyManagerError {
-    #[error("Key not found: {0}")]
-    KeyNotFound(Uuid),
-    #[error("Key rotation failed: {0}")]
-    RotationFailed(String),
-    #[error("Storage error: {0}")]
-    StorageError(String),
-    #[error("Memory error: {0}")]
-    MemoryError(String),
-    #[error("Quantum operation failed: {0}")]
-    QuantumError(String),
-    #[error("Audit error: {0}")]
-    AuditError(String),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeyPolicy {
-    pub rotation_period: Duration,
-    pub security_level: SecurityLevel,
-    pub require_backup: bool,
-    pub allowed_uses: Vec<KeyUsage>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum KeyUsage {
-    Signing,
-    Authentication,
-    IdentityVerification,
-    TemplateProtection,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeyMetadata {
-    pub created_at: DateTime<Utc>,
-    pub last_used: DateTime<Utc>,
-    pub rotation_count: u32,
-    pub usages: Vec<KeyUsage>,
-    pub policy: KeyPolicy,
-}
+const PBKDF2_ITERATIONS: u32 = 100_000;
+const KEY_LEN: usize = 32;
+const SALT_LEN: usize = 16;
 
 pub struct KeyManager {
-    secure_memory: Arc<SecureMemory>,
-    quantum_processor: Arc<QuantumResistantProcessor>,
-    audit_system: Arc<AuditSystem>,
-    active_keys: Arc<RwLock<HashMap<Uuid, (KeyPair, KeyMetadata)>>>,
-    key_policies: Arc<RwLock<HashMap<KeyUsage, KeyPolicy>>>,
-    metadata: Arc<RwLock<CryptoMetadata>>,
+    master_key: RwLock<Vec<u8>>,
+    encryption_key: RwLock<Aes256Gcm>,
 }
 
 impl KeyManager {
-    pub async fn new(
-        secure_memory: Arc<SecureMemory>,
-        quantum_processor: Arc<QuantumResistantProcessor>,
-        audit_system: Arc<AuditSystem>,
-        security_level: SecurityLevel,
-    ) -> Result<Self, KeyManagerError> {
-        let manager = Self {
-            secure_memory,
-            quantum_processor,
-            audit_system,
-            active_keys: Arc::new(RwLock::new(HashMap::new())),
-            key_policies: Arc::new(RwLock::new(HashMap::new())),
-            metadata: Arc::new(RwLock::new(CryptoMetadata::new(security_level))),
-        };
-
-        // Initialize default policies
-        manager.initialize_default_policies().await?;
-
-        // Start key rotation scheduler
-        manager.start_rotation_scheduler();
-
-        // Record initialization in audit
-        manager.audit_system
-            .record_event(
-                AuditEventType::SystemStartup,
-                None,
-                Some(serde_json::json!({
-                    "component": "KeyManager",
-                    "security_level": format!("{:?}", security_level)
-                }))
-            )
-            .await
-            .map_err(|e| KeyManagerError::AuditError(e.to_string()))?;
-
-        Ok(manager)
-    }
-
-    async fn initialize_default_policies(&self) -> Result<(), KeyManagerError> {
-        let mut policies = self.key_policies.write().await;
-
-        let default_policies = vec![
-            (KeyUsage::Signing, KeyPolicy {
-                rotation_period: Duration::days(30),
-                security_level: SecurityLevel::High,
-                require_backup: true,
-                allowed_uses: vec![KeyUsage::Signing],
-            }),
-            (KeyUsage::Authentication, KeyPolicy {
-                rotation_period: Duration::days(90),
-                security_level: SecurityLevel::Standard,
-                require_backup: true,
-                allowed_uses: vec![KeyUsage::Authentication],
-            }),
-            (KeyUsage::IdentityVerification, KeyPolicy {
-                rotation_period: Duration::days(180),
-                security_level: SecurityLevel::High,
-                require_backup: true,
-                allowed_uses: vec![KeyUsage::IdentityVerification],
-            }),
-            (KeyUsage::TemplateProtection, KeyPolicy {
-                rotation_period: Duration::days(365),
-                security_level: SecurityLevel::High,
-                require_backup: true,
-                allowed_uses: vec![KeyUsage::TemplateProtection],
-            }),
-        ];
-
-        for (usage, policy) in default_policies {
-            policies.insert(usage, policy);
+    pub fn new(encryption_key: &str) -> Result<Self> {
+        if encryption_key.is_empty() {
+            return Err(NodeError::Crypto("Encryption key cannot be empty".into()));
         }
 
-        Ok(())
+        // Generate master key using PBKDF2
+        let mut salt = [0u8; SALT_LEN];
+        ring::rand::SystemRandom::new()
+            .fill(&mut salt)
+            .map_err(|_| NodeError::Crypto("Failed to generate salt".into()))?;
+
+        let mut master_key = vec![0u8; KEY_LEN];
+        pbkdf2::derive(
+            pbkdf2::PBKDF2_HMAC_SHA256,
+            std::num::NonZeroU32::new(PBKDF2_ITERATIONS).unwrap(),
+            &salt,
+            encryption_key.as_bytes(),
+            &mut master_key,
+        );
+
+        // Initialize AES-GCM cipher
+        let cipher = Aes256Gcm::new_from_slice(&master_key)
+            .map_err(|e| NodeError::Crypto(format!("Failed to initialize cipher: {}", e)))?;
+
+        Ok(Self {
+            master_key: RwLock::new(master_key),
+            encryption_key: RwLock::new(cipher),
+        })
     }
 
-    pub async fn generate_key(
-        &self,
-        usage: KeyUsage,
-    ) -> Result<Uuid, KeyManagerError> {
-        // Get policy for key usage
-        let policies = self.key_policies.read().await;
-        let policy = policies.get(&usage)
-            .ok_or_else(|| KeyManagerError::KeyNotFound(Uuid::nil()))?;
+    pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
+        let mut nonce = [0u8; 12];
+        ring::rand::SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| NodeError::Crypto("Failed to generate nonce".into()))?;
 
-        // Generate keypair
-        self.quantum_processor.change_security_level(policy.security_level);
-        let keypair = self.quantum_processor
-            .generate_keypair()
-            .map_err(|e| KeyManagerError::QuantumError(e.to_string()))?;
-
-        // Create metadata
-        let metadata = KeyMetadata {
-            created_at: Utc::now(),
-            last_used: Utc::now(),
-            rotation_count: 0,
-            usages: vec![usage.clone()],
-            policy: policy.clone(),
-        };
-
-        // Store key
-        self.active_keys.write().await
-            .insert(keypair.id, (keypair.clone(), metadata));
-
-        // Audit key generation
-        self.audit_system
-            .record_event(
-                AuditEventType::KeyGeneration,
-                Some(keypair.id),
-                Some(serde_json::json!({
-                    "usage": format!("{:?}", usage),
-                    "security_level": format!("{:?}", policy.security_level)
-                }))
-            )
-            .await
-            .map_err(|e| KeyManagerError::AuditError(e.to_string()))?;
-
-        Ok(keypair.id)
-    }
-
-    pub async fn get_key(
-        &self,
-        key_id: Uuid,
-        usage: KeyUsage,
-    ) -> Result<KeyPair, KeyManagerError> {
-        let mut active_keys = self.active_keys.write().await;
+        let nonce = Nonce::from_slice(&nonce);
         
-        if let Some((keypair, metadata)) = active_keys.get_mut(&key_id) {
-            // Verify usage is allowed
-            if !metadata.policy.allowed_uses.contains(&usage) {
-                return Err(KeyManagerError::KeyNotFound(key_id));
-            }
+        let cipher = self.encryption_key.read().unwrap();
+        let ciphertext = cipher
+            .encrypt(nonce, data)
+            .map_err(|e| NodeError::Crypto(format!("Encryption failed: {}", e)))?;
 
-            // Update last used timestamp
-            metadata.last_used = Utc::now();
+        // Combine nonce and ciphertext
+        let mut result = Vec::with_capacity(nonce.len() + ciphertext.len());
+        result.extend_from_slice(nonce);
+        result.extend_from_slice(&ciphertext);
 
-            // Audit key access
-            self.audit_system
-                .record_event(
-                    AuditEventType::KeyGeneration,
-                    Some(key_id),
-                    Some(serde_json::json!({
-                        "usage": format!("{:?}", usage),
-                        "action": "access"
-                    }))
-                )
-                .await
-                .map_err(|e| KeyManagerError::AuditError(e.to_string()))?;
-
-            Ok(keypair.clone())
-        } else {
-            Err(KeyManagerError::KeyNotFound(key_id))
-        }
+        Ok(result)
     }
 
-    async fn rotate_key(
-        &self,
-        key_id: Uuid,
-    ) -> Result<Uuid, KeyManagerError> {
-        let mut active_keys = self.active_keys.write().await;
+    pub fn decrypt(&self, encrypted_data: &[u8]) -> Result<Vec<u8>> {
+        if encrypted_data.len() < 12 {
+            return Err(NodeError::Crypto("Invalid encrypted data".into()));
+        }
+
+        let (nonce, ciphertext) = encrypted_data.split_at(12);
+        let nonce = Nonce::from_slice(nonce);
+
+        let cipher = self.encryption_key.read().unwrap();
+        cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| NodeError::Crypto(format!("Decryption failed: {}", e)))
+    }
+
+    pub fn hash_features(&self, features: &[f32]) -> Result<String> {
+        // Convert features to bytes
+        let mut bytes = Vec::with_capacity(features.len() * 4);
+        for feature in features {
+            bytes.extend_from_slice(&feature.to_le_bytes());
+        }
+
+        // Add master key as salt
+        let master_key = self.master_key.read().unwrap();
+        bytes.extend_from_slice(&master_key);
+
+        // Use SHA3-256 for hashing
+        let mut hasher = Sha3_256::new();
+        hasher.update(&bytes);
+        let result = hasher.finalize();
+
+        Ok(hex::encode(result))
+    }
+
+    pub fn rotate_keys(&self) -> Result<()> {
+        let mut new_key = vec![0u8; KEY_LEN];
+        ring::rand::SystemRandom::new()
+            .fill(&mut new_key)
+            .map_err(|_| NodeError::Crypto("Failed to generate new key".into()))?;
+
+        let new_cipher = Aes256Gcm::new_from_slice(&new_key)
+            .map_err(|e| NodeError::Crypto(format!("Failed to initialize new cipher: {}", e)))?;
+
+        // Update keys atomically
+        {
+            let mut master_key = self.master_key.write().unwrap();
+            let mut encryption_key = self.encryption_key.write().unwrap();
+            *master_key = new_key;
+            *encryption_key = new_cipher;
+        }
+
+        Ok(())
+    }
+
+    pub fn derive_key(&self, purpose: &str) -> Result<Vec<u8>> {
+        let master_key = self.master_key.read().unwrap();
         
-        if let Some((old_keypair, mut metadata)) = active_keys.remove(&key_id) {
-            // Generate new keypair with same policy
-            self.quantum_processor.change_security_level(metadata.policy.security_level);
-            let new_keypair = self.quantum_processor
-                .generate_keypair()
-                .map_err(|e| KeyManagerError::QuantumError(e.to_string()))?;
-
-            // Update metadata
-            metadata.rotation_count += 1;
-            metadata.created_at = Utc::now();
-            metadata.last_used = Utc::now();
-
-            // Store new key
-            active_keys.insert(new_keypair.id, (new_keypair.clone(), metadata));
-
-            // Audit key rotation
-            self.audit_system
-                .record_event(
-                    AuditEventType::KeyRotation,
-                    Some(new_keypair.id),
-                    Some(serde_json::json!({
-                        "old_key_id": key_id.to_string(),
-                        "rotation_count": metadata.rotation_count
-                    }))
-                )
-                .await
-                .map_err(|e| KeyManagerError::AuditError(e.to_string()))?;
-
-            Ok(new_keypair.id)
-        } else {
-            Err(KeyManagerError::KeyNotFound(key_id))
-        }
-    }
-
-    fn start_rotation_scheduler(&self) {
-        let key_manager = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::hours(1).to_std().unwrap());
-            
-            loop {
-                interval.tick().await;
-                if let Err(e) = key_manager.check_and_rotate_keys().await {
-                    eprintln!("Key rotation error: {}", e);
-                }
-            }
-        });
-    }
-
-    async fn check_and_rotate_keys(&self) -> Result<(), KeyManagerError> {
-        let active_keys = self.active_keys.read().await;
-        let now = Utc::now();
-
-        for (key_id, (_, metadata)) in active_keys.iter() {
-            if now - metadata.created_at > metadata.policy.rotation_period {
-                // Release read lock before rotation
-                drop(active_keys);
-                self.rotate_key(*key_id).await?;
-                break;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn update_policy(
-        &self,
-        usage: KeyUsage,
-        policy: KeyPolicy,
-    ) -> Result<(), KeyManagerError> {
-        let mut policies = self.key_policies.write().await;
-        policies.insert(usage.clone(), policy.clone());
-
-        // Audit policy update
-        self.audit_system
-            .record_event(
-                AuditEventType::SecurityLevelChange,
-                None,
-                Some(serde_json::json!({
-                    "usage": format!("{:?}", usage),
-                    "new_policy": serde_json::to_string(&policy).unwrap()
-                }))
-            )
-            .await
-            .map_err(|e| KeyManagerError::AuditError(e.to_string()))?;
-
-        Ok(())
-    }
-}
-
-impl Clone for KeyManager {
-    fn clone(&self) -> Self {
-        Self {
-            secure_memory: self.secure_memory.clone(),
-            quantum_processor: self.quantum_processor.clone(),
-            audit_system: self.audit_system.clone(),
-            active_keys: self.active_keys.clone(),
-            key_policies: self.key_policies.clone(),
-            metadata: self.metadata.clone(),
-        }
+        let mut context = digest::Context::new(&digest::SHA256);
+        context.update(&master_key);
+        context.update(purpose.as_bytes());
+        
+        let derived = context.finish();
+        Ok(derived.as_ref().to_vec())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    async fn create_test_manager() -> KeyManager {
-        let secure_memory = Arc::new(SecureMemory::new(8192).unwrap());
-        let quantum_processor = Arc::new(QuantumResistantProcessor::new(SecurityLevel::Standard).unwrap());
-        let audit_system = Arc::new(AuditSystem::new(30, SecurityLevel::Standard));
+
+    #[test]
+    fn test_encryption_decryption() {
+        let key_manager = KeyManager::new("test_key").unwrap();
+        let data = b"test data";
         
-        KeyManager::new(
-            secure_memory,
-            quantum_processor,
-            audit_system,
-            SecurityLevel::Standard,
-        ).await.unwrap()
+        let encrypted = key_manager.encrypt(data).unwrap();
+        let decrypted = key_manager.decrypt(&encrypted).unwrap();
+        
+        assert_eq!(data.to_vec(), decrypted);
     }
 
-    #[tokio::test]
-    async fn test_key_generation_and_retrieval() {
-        let manager = create_test_manager().await;
+    #[test]
+    fn test_feature_hashing() {
+        let key_manager = KeyManager::new("test_key").unwrap();
+        let features = vec![0.1, 0.2, 0.3];
         
-        let key_id = manager.generate_key(KeyUsage::Signing).await.unwrap();
-        let keypair = manager.get_key(key_id, KeyUsage::Signing).await.unwrap();
+        let hash1 = key_manager.hash_features(&features).unwrap();
+        let hash2 = key_manager.hash_features(&features).unwrap();
         
-        assert_eq!(keypair.id, key_id);
+        assert_eq!(hash1, hash2);
     }
 
-    #[tokio::test]
-    async fn test_key_rotation() {
-        let manager = create_test_manager().await;
+    #[test]
+    fn test_key_rotation() {
+        let key_manager = KeyManager::new("test_key").unwrap();
+        let data = b"test data";
         
-        let key_id = manager.generate_key(KeyUsage::Signing).await.unwrap();
-        let new_key_id = manager.rotate_key(key_id).await.unwrap();
+        let encrypted = key_manager.encrypt(data).unwrap();
+        key_manager.rotate_keys().unwrap();
         
-        assert_ne!(key_id, new_key_id);
-        assert!(manager.get_key(key_id, KeyUsage::Signing).await.is_err());
-        assert!(manager.get_key(new_key_id, KeyUsage::Signing).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_policy_update() {
-        let manager = create_test_manager().await;
-        
-        let new_policy = KeyPolicy {
-            rotation_period: Duration::days(15),
-            security_level: SecurityLevel::High,
-            require_backup: true,
-            allowed_uses: vec![KeyUsage::Signing],
-        };
-        
-        assert!(manager.update_policy(KeyUsage::Signing, new_policy).await.is_ok());
+        // Previous encrypted data should not be decryptable after rotation
+        assert!(key_manager.decrypt(&encrypted).is_err());
     }
 }

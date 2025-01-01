@@ -53,13 +53,21 @@ impl DiscoveryService {
     }
 
     pub async fn start(&self) -> Result<()> {
-        // Implementation for peer discovery
-        // This would include DHT, bootstrap nodes, etc.
-        todo!("Implement peer discovery")
+        // Example implementation for peer discovery using bootstrap nodes
+        for peer in &self.bootstrap_peers {
+            self.network.add_peer(PeerInfo {
+                id: peer.clone(),
+                address: peer.clone(),
+                port: 8080, // Example port
+            }).await?;
+        }
+        info!("Peer discovery started with bootstrap peers: {:?}", self.bootstrap_peers);
+        Ok(())
     }
 
     pub async fn stop(&self) -> Result<()> {
-        todo!("Implement discovery shutdown")
+        info!("Peer discovery stopped");
+        Ok(())
     }
 }
 
@@ -74,11 +82,43 @@ impl MessageHandler {
     }
 
     pub async fn start(&self) -> Result<()> {
-        // Implementation for message handling
-        todo!("Implement message handling")
+        // Example implementation for message handling
+        loop {
+            let message = self.network.receive_message().await?;
+            info!("Received message: {:?}", message);
+
+            // Process message (e.g., validate, store, forward)
+            self.process_message(message).await?;
+        }
     }
 
     pub async fn stop(&self) -> Result<()> {
-        todo!("Implement handler shutdown")
+        info!("Message handler stopped");
+        Ok(())
+    }
+
+    async fn process_message(&self, message: NetworkMessage) -> Result<()> {
+        // Example message processing logic
+        // Validate message
+        if !self.validate_message(&message).await? {
+            return Err(NetworkError::InvalidMessage.into());
+        }
+
+        // Store message in local blockchain
+        self.store_message(&message).await?;
+
+        // Forward message to peers
+        self.network.broadcast(&message).await?;
+        Ok(())
+    }
+
+    async fn validate_message(&self, message: &NetworkMessage) -> Result<bool> {
+        // Placeholder for message validation logic
+        Ok(true)
+    }
+
+    async fn store_message(&self, message: &NetworkMessage) -> Result<()> {
+        // Placeholder for storing message in local blockchain
+        Ok(())
     }
 }

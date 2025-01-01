@@ -1,80 +1,144 @@
-
-
-OBSOLETE-delete
-
 #!/bin/bash
-# Create project structure
-cargo new secure-identity-node
-cd secure-identity-node
 
-# Create directories
-for dir in \
-    src/{core/{identity,crypto,blockchain},network,api/handlers,plugins/{traits,official/{face_recognition,behavior_analysis,quantum_resistant}},storage,utils} \
-    tests/{common,integration,unit} \
-    benches \
-    config; do
-    mkdir -p "$dir"
-done
+set -e  # Exit on any error
 
-# Create initial Cargo.toml
-cat > Cargo.toml << 'EOF'
-[package]
-name = "secure-identity-node"
-version = "0.1.0"
-edition = "2021"
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
 
-[dependencies]
-tokio = { version = "1.0", features = ["full"] }
-solana-sdk = "1.17"
-thiserror = "1.0"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-config = "0.13"
-dilithium = "0.1"
-libp2p = "0.52"
+echo -e "${GREEN}Starting Freeghost development environment setup...${NC}"
 
-[dev-dependencies]
-tokio-test = "0.4"
-criterion = "0.4"
+# Check for root privileges
+if [ "$EUID" -ne 0 ]; then 
+    echo -e "${YELLOW}Please run as root or with sudo${NC}"
+    exit 1
+fi
 
-[[bench]]
-name = "identity_bench"
-harness = false
+# Detect OS
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS=$NAME
+else
+    echo -e "${RED}Cannot detect operating system${NC}"
+    exit 1
+fi
 
-[[bench]]
-name = "crypto_bench"
-harness = false
+# Install system dependencies based on OS
+echo -e "${GREEN}Installing system dependencies...${NC}"
+
+case $OS in
+    "Ubuntu"|"Debian GNU/Linux")
+        apt-get update
+        apt-get install -y \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            librocksdb-dev \
+            clang \
+            cmake \
+            git \
+            curl \
+            llvm \
+            python3 \
+            python3-pip
+        ;;
+    "Fedora")
+        dnf install -y \
+            gcc \
+            gcc-c++ \
+            make \
+            pkg-config \
+            openssl-devel \
+            rocksdb-devel \
+            clang \
+            cmake \
+            git \
+            curl \
+            llvm \
+            python3 \
+            python3-pip
+        ;;
+    *)
+        echo -e "${RED}Unsupported operating system: $OS${NC}"
+        exit 1
+        ;;
+esac
+
+# Install Rust if not already installed
+if ! command -v rustc &> /dev/null; then
+    echo -e "${GREEN}Installing Rust...${NC}"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    source $HOME/.cargo/env
+else
+    echo -e "${YELLOW}Rust is already installed${NC}"
+fi
+
+# Update Rust
+echo -e "${GREEN}Updating Rust...${NC}"
+rustup update
+rustup component add rustfmt clippy
+
+# Create development directories
+echo -e "${GREEN}Creating development directories...${NC}"
+mkdir -p config/local
+mkdir -p data/storage
+mkdir -p certs
+
+# Generate development certificates
+echo -e "${GREEN}Generating development certificates...${NC}"
+openssl req -x509 -newkey rsa:4096 -nodes -keyout certs/server.key -out certs/server.crt -days 365 -subj "/CN=localhost"
+
+# Create local configuration
+echo -e "${GREEN}Creating local configuration...${NC}"
+if [ ! -f config/local.toml ]; then
+    cp config/default.toml config/local.toml
+    # Generate random encryption key
+    ENCRYPTION_KEY=$(openssl rand -hex 32)
+    # Update encryption key in local config
+    sed -i "s/encryption_key = \"\"/encryption_key = \"$ENCRYPTION_KEY\"/" config/local.toml
+fi
+
+# Set up git hooks
+echo -e "${GREEN}Setting up git hooks...${NC}"
+cat > .git/hooks/pre-commit << 'EOF'
+#!/bin/bash
+set -e
+
+echo "Running cargo fmt..."
+cargo fmt -- --check
+
+echo "Running cargo clippy..."
+cargo clippy -- -D warnings
+
+echo "Running tests..."
+cargo test
 EOF
 
-# Create core type definitions
-cat > src/core/types.rs << 'EOF'
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
+chmod +x .git/hooks/pre-commit
 
-#[derive(Debug, Error)]
-pub enum CoreError {
-    #[error("Identity error: {0}")]
-    Identity(String),
-    #[error("Crypto error: {0}")]
-    Crypto(String),
-    #[error("Network error: {0}")]
-    Network(String),
-}
+# Build project
+echo -e "${GREEN}Building project...${NC}"
+cargo build
 
-pub type Result<T> = std::result::Result<T, CoreError>;
-EOF
+# Run tests
+echo -e "${GREEN}Running tests...${NC}"
+cargo test
 
-# Initialize git repository
-git init
-cat > .gitignore << 'EOF'
-/target
-**/*.rs.bk
-Cargo.lock
-.env
-*.pem
-*.key
-EOF
+# Final instructions
+echo -e "${GREEN}Setup complete!${NC}"
+echo -e "${YELLOW}Next steps:${NC}"
+echo "1. Review config/local.toml and adjust settings as needed"
+echo "2. Start the development server with: cargo run"
+echo "3. Run tests with: cargo test"
+echo "4. Format code with: cargo fmt"
+echo "5. Check for issues with: cargo clippy"
 
-echo "Project structure created successfully!"
+# Check if setup was successful
+if [ $? -eq 0 ]; then
+    echo -e "${GREEN}Development environment setup completed successfully!${NC}"
+else
+    echo -e "${RED}Setup failed. Please check the error messages above.${NC}"
+    exit 1
+fi
