@@ -1,5 +1,21 @@
-# Freeghost Identity Management System
+#THIS PROJECT IS JUST XPERIMENTAL AND CODE IS NOT WORKING but is FREE.
 
+FreeGhost aim to be the invisibility shield for the people of all the world.
+It want to override the Sourveillance Once you create your identity, you existz on the chain.
+Once you exists you will have granted access to all your services (that uses FreeGhost node AUTH).
+THE SYSTEM YOU ARE CONNECTING, CANNOT IDENTIFY YOU  (if you don't want that).
+
+Running a FreeGhost Node into a web application, let users to be completely anonymous but Univocally identified.
+The System analyze users biometric data and comportamental data, uses complex alghorithms and tricks to avoid fakes, spoofing, 
+ break connections if detect fear  or any type of alert can conduct to a forced login.
+ 
+ Severely prompt engineered on OpenAI 01 and Claude3,...scratchly ruined gaming with Bolt.new ,
+  full of indecisions if use a chain or Distributed Hashes over Tor,
+ low Entropy  for some devices, contracts?
+
+T.N.
+
+# Freeghost Identity Management System
 A secure, quantum-resistant identity management system built in Rust. Freeghost provides robust identity verification with biometric processing, behavioral analysis, and advanced cryptographic protection.
 
 ## Features
